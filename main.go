@@ -7,17 +7,29 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/amimof/huego"
 	"gopkg.in/ini.v1"
 )
 
 type Config struct {
-	cfg       *ini.File
-	User      string
-	Address   string
-	HuePlayID string
+	cfg           *ini.File
+	User          string
+	Address       string
+	HuePlayID     string
+	ManageNumlock bool
+	Debug         bool
+}
+
+func (c *Config) String() string {
+	return fmt.Sprintf(
+		"User: %s, Address: %s, huePlayID: %s, ManageNumlock: %v, Debug: %v",
+		c.User, c.Address, c.HuePlayID, c.ManageNumlock, c.Debug,
+	)
 }
 
 func (c *Config) getSection(name string) *ini.Section {
@@ -28,20 +40,47 @@ func (c *Config) getStringKey(name string, section *ini.Section) string {
 	return section.Key(name).String()
 }
 
+func (c *Config) getBoolKey(name string, section *ini.Section) bool {
+	result, err := section.Key(name).Bool()
+	if err != nil {
+		return false
+	}
+	return result
+}
+
 func (c *Config) Load(cfgFile string) (err error) {
 	c.cfg, err = ini.Load(cfgFile)
 	if err != nil {
 		return err
 	}
+	// Hue
 	section := c.getSection("Hue")
 	c.User = c.getStringKey("User", section)
 	c.Address = c.getStringKey("Address", section)
 	c.HuePlayID = c.getStringKey("HuePlayID", section)
+	// Keyboard
+	keyboardSection := c.getSection("Keyboard")
+	c.ManageNumlock = c.getBoolKey("ManageNumlock", keyboardSection)
+	// Default
+	defaultSection := c.getSection("Default")
+	c.Debug = c.getBoolKey("Debug", defaultSection)
 	return nil
 }
 
 type HueMon struct {
-	HuePlayID string
+	numlockStatus bool
+	keyboardLock  *sync.Mutex
+	huePlayID     string
+	// Public
+	Cfg *Config
+}
+
+func NewHueMon(cfg *Config) *HueMon {
+	return &HueMon{
+		keyboardLock: &sync.Mutex{},
+		huePlayID:    cfg.HuePlayID,
+		Cfg:          cfg,
+	}
 }
 
 func (hm *HueMon) GetLights(bridge *huego.Bridge) ([]int, error) {
@@ -52,7 +91,7 @@ func (hm *HueMon) GetLights(bridge *huego.Bridge) ([]int, error) {
 
 	playLights := make([]int, 0)
 	for _, light := range l {
-		if light.ModelID != hm.HuePlayID {
+		if light.ModelID != hm.huePlayID {
 			continue
 		}
 		playLights = append(playLights, light.ID)
@@ -69,6 +108,44 @@ func (hm *HueMon) TurnOn(playLights []int, bridge *huego.Bridge) {
 		}
 		light.On()
 	}
+}
+
+func (hm *HueMon) NumlockOn() {
+	if !hm.Cfg.ManageNumlock {
+		log.Debug("Numlock support disabled by configuration")
+		return
+	}
+	hm.keyboardLock.Lock()
+	defer hm.keyboardLock.Unlock()
+	if hm.numlockStatus {
+		return
+	}
+	_, err := exec.Command("numlockx", "on").Output()
+	if err != nil {
+		log.Errorf("NumlockOn: %v\n", err)
+		return
+	}
+	hm.numlockStatus = true
+	log.Debug("Numlock turned on")
+}
+
+func (hm *HueMon) NumlockOff() {
+	if !hm.Cfg.ManageNumlock {
+		log.Debug("Numlock support disabled by configuration")
+		return
+	}
+	hm.keyboardLock.Lock()
+	defer hm.keyboardLock.Unlock()
+	if !hm.numlockStatus {
+		return
+	}
+	_, err := exec.Command("numlockx", "off").Output()
+	if err != nil {
+		log.Errorf("NumlockOff: %v\n", err)
+		return
+	}
+	hm.numlockStatus = false
+	log.Debug("Numlock turned off")
 }
 
 func (hm *HueMon) TurnOff(playLights []int, bridge *huego.Bridge) {
@@ -95,16 +172,19 @@ func (hm *HueMon) Watch(playLights []int, bridge *huego.Bridge) {
 	result = reg.ReplaceAllString(result, ``)
 	//
 	state := strings.TrimSpace(result)
-	fmt.Println(state)
+	log.Println(state)
 	switch state {
 	case "blanked", "locked":
 		hm.TurnOff(playLights, bridge)
+		hm.NumlockOff()
 	case "non-blanked":
 		hm.TurnOn(playLights, bridge)
+		hm.NumlockOn()
 	default:
-		fmt.Printf("Got unknown state: %s", state)
+		log.Printf("Got unknown state: %s", state)
 	}
 }
+
 func Discover(hostname string) {
 	bridge, err := huego.Discover()
 	if err != nil {
@@ -116,7 +196,7 @@ func Discover(hostname string) {
 		panic(err)
 	}
 	bridge = bridge.Login(user)
-	fmt.Println(bridge, user)
+	log.Println(bridge, user)
 }
 
 func main() {
@@ -138,23 +218,34 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	log.SetLevel(log.InfoLevel)
+	if cfg.Debug {
+		log.SetLevel(log.DebugLevel)
+		log.Debug("Debug mode enabled")
+		log.Debug(cfg)
+	}
 	bridge := huego.New(cfg.Address, cfg.User)
-	hueMon := &HueMon{HuePlayID: cfg.HuePlayID}
+	hueMon := NewHueMon(cfg)
 	lights, err := hueMon.GetLights(bridge)
 	if err != nil {
 		panic(err)
 	}
+	// Turn on numlock on start
+	hueMon.NumlockOn()
+	//
 	switch *cmd {
 	case "on":
 		hueMon.TurnOn(lights, bridge)
+		hueMon.NumlockOn()
 	case "off":
 		hueMon.TurnOff(lights, bridge)
+		hueMon.NumlockOff()
 	case "watch":
 		for {
 			hueMon.Watch(lights, bridge)
 			time.Sleep(3 * time.Second)
 		}
 	default:
-		fmt.Printf("Unsupported command: %s", *cmd)
+		log.Printf("Unsupported command: `%s`\n", *cmd)
 	}
 }
