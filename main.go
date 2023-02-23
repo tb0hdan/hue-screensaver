@@ -20,7 +20,7 @@ type Config struct {
 	cfg           *ini.File
 	User          string
 	Address       string
-	HuePlayID     string
+	HuePlayID     []string
 	ManageNumlock bool
 	Debug         bool
 }
@@ -57,7 +57,7 @@ func (c *Config) Load(cfgFile string) (err error) {
 	section := c.getSection("Hue")
 	c.User = c.getStringKey("User", section)
 	c.Address = c.getStringKey("Address", section)
-	c.HuePlayID = c.getStringKey("HuePlayID", section)
+	c.HuePlayID = strings.Split(c.getStringKey("HuePlayID", section), ",")
 	// Keyboard
 	keyboardSection := c.getSection("Keyboard")
 	c.ManageNumlock = c.getBoolKey("ManageNumlock", keyboardSection)
@@ -70,9 +70,10 @@ func (c *Config) Load(cfgFile string) (err error) {
 type HueMon struct {
 	numlockStatus bool
 	keyboardLock  *sync.Mutex
-	huePlayID     string
+	huePlayID     []string
 	// Public
-	Cfg *Config
+	Cfg   *Config
+	Debug bool
 }
 
 func NewHueMon(cfg *Config) *HueMon {
@@ -80,6 +81,7 @@ func NewHueMon(cfg *Config) *HueMon {
 		keyboardLock: &sync.Mutex{},
 		huePlayID:    cfg.HuePlayID,
 		Cfg:          cfg,
+		Debug:        cfg.Debug,
 	}
 }
 
@@ -88,13 +90,21 @@ func (hm *HueMon) GetLights(bridge *huego.Bridge) ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	if hm.Debug {
+		fmt.Println(l)
+	}
 	playLights := make([]int, 0)
 	for _, light := range l {
-		if light.ModelID != hm.huePlayID {
-			continue
+		isPlayBar := false
+		for _, hueLightID := range hm.huePlayID {
+			if light.ModelID != hueLightID {
+				continue
+			}
+			isPlayBar = true
 		}
-		playLights = append(playLights, light.ID)
+		if isPlayBar {
+			playLights = append(playLights, light.ID)
+		}
 	}
 
 	return playLights, nil
@@ -230,6 +240,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	fmt.Println("x", lights)
 	// Turn on numlock on start
 	hueMon.NumlockOn()
 	//
